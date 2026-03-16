@@ -1,0 +1,168 @@
+# marketing.py
+import pandas as pd
+import json
+import re
+from datetime import datetime
+from gmssl import sm3, func
+from oracle_agent import run_sql, clean_df
+import requests
+
+def sm3_hash_upper(value: str) -> str:
+    value_bytes = value.encode('utf-8')
+    hash_list = sm3.sm3_hash(func.bytes_to_list(value_bytes))
+    return hash_list.upper()
+
+def match_attr(df):
+    trans_mod = {'外卡':'0','内卡':'1'}
+    df['卡来源']=df['卡来源'].map(trans_mod)
+    df['卡等级']=df['卡等级'].map(lambda x : '0' + str(x))
+    df['PAN输入方式'] = df['PAN输入方式'].map(lambda x : str(x)[:2] if pd.notna(x) else x)
+    return df
+    
+
+def get_discount_transaction(
+    trans_amt: str,          # 建议改为 Decimal 或 int
+    pri_acct_num: str,
+    sett_date: str           # YYYYMMDD 或 YYYY-MM-DD 均可，视表字段
+) -> pd.DataFrame:
+    # 差in-app
+    pri_sm3 = sm3_hash_upper(pri_acct_num.strip())
+    # 确定一致： PAN输入方式 --> SRV_ENTRY_MOD
+    #           交易介质
+    #           卡来源 --> 发卡属性
+    # 卡等级、移动支付产品字段数据库更多
+    # 卡产品 配置表信息更多, 定义有出入
+    # 交易权限不管
+    sql = f"""
+    SELECT 交易时间,
+           trans_amt 交易金额,
+           pri_acct_num 发卡侧卡号,
+           pri_acct_num_sm3 SM3加密卡号,
+           acq_ins_cde 受理机构,
+           收单地区 受理地区,
+           mcc_cde 商户类型,
+           mer_id 商户代码,
+           卡BIN,
+           发卡 发卡机构代码,
+           card_rank_cde 卡等级,
+           card_prdct_cde 卡产品,
+           card_attr 卡性质,brand_cde 卡品牌,
+           收单属性,发卡属性 卡来源,渠道 交易渠道, mpay_cde 移动支付产品, card_media 交易介质, srv_entry_mod PAN输入方式
+           
+           
+    FROM szopr.tbl_daily_trans_temp_15
+    WHERE trans_amt = '{trans_amt}'
+      AND pri_acct_num_sm3 = '{pri_sm3}'
+      AND sett_dt = TO_DATE('{sett_date}', 'YYYYMMDD')
+    """
+    df  = run_sql(sql)
+    transform = match_attr(df)
+    trans = clean_df(transform)
+    t = json.dumps(
+                trans.to_dict(orient="records"),
+                indent=1,
+                ensure_ascii=False
+            )
+    return t
+
+
+
+def load_json(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+def remove_think(ans):
+    pat = r'<think>.*?</think>'
+    cleaned = re.sub(pat,'',ans,flags=re.DOTALL)
+    cleaned = re.sub(r'\n\s*\n','\n\n',cleaned).strip()
+    return cleaned
+
+# ================= 配置区 =================
+API_KEY = "168F649870A0FfC4c415aAe2F6Df2E5B"
+BASE_URL = "http://184.86.52.4:25059/v1/chat/completions"
+# ================= 提示词定义 =================
+# 分析 Agent：采用 ReAct 模式
+ANALYST_SYSTEM_PROMPT = """
+你是一个支付业务排查专家。请使用 ReAct 模式判断交易是否命中立减活动。
+你必须严格遵守以下排查路径，并在输出中包含 [Thought], [Action], [Observation] 步骤：
+
+1. [全局准入]: 核对时间、卡BIN、发卡机构、卡性质(借/贷)、卡等级等基础信息。
+2. [场景路由]: 根据交易特征寻找对应的 activity.json 中的场景(scenarios)。
+3. [精准匹配]: 重点核对 [受理机构代码 + 商户代码] 组合。
+4. [金额与属性]: 检查交易金额是否达标，以及交易渠道、移动支付产品是否符合。
+
+注意：
+- 忽略: 交易位图、in-app、app编码。
+- 如果未命中，必须指出具体的差异字段和值。
+"""
+
+# 审计 Agent：负责逻辑挑错
+AUDITOR_SYSTEM_PROMPT = """
+你是一个资深的审计员。你的任务是复核【分析报告】。
+请重点审计：
+1. 分析过程是否跳过了“受理机构+商户代码”的组合检查？
+2. 分析过程是否核对了“交易金额”是否达到该场景的起跳门槛？
+3. 是否错误地忽略了活动中的排除性条件？
+
+如果分析逻辑完美，请回答“审计通过”。
+如果发现漏洞，请指出“逻辑风险点”并给出纠正建议。
+"""
+
+class PaymentReActAgent:
+    def __init__(self, api_key):
+        self.api_key = api_key
+
+    def _call_deepseek(self, system_msg, user_msg):
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            "temperature": 0.2
+        }
+        try:
+            response = requests.post(BASE_URL, headers=headers, json=data, timeout=120)
+            response.raise_for_status()
+            return response.json()['choices'][0]['message']['content']
+        except Exception as e:
+            return f"API调用失败: {str(e)}"
+
+    def analyze(self, output_json, activity_json):
+        # 1. 准备上下文
+        user_input = f"""
+        请分析以下数据：
+        ---
+        【交易报文 output.json】
+        {json.dumps(output_json, ensure_ascii=False, indent=2)}
+        
+        【活动配置 activity.json】
+        {json.dumps(activity_json, ensure_ascii=False, indent=2)}
+        ---
+        请开始排查：
+        """
+        
+        print("\n[Step 1] 分析 Agent 开始推理 (ReAct)...")
+        analysis_res = self._call_deepseek(ANALYST_SYSTEM_PROMPT, user_input)
+        print("-" * 30)
+        print(analysis_res)
+        
+        # 2. 触发审计
+        print("\n[Step 2] 审计 Agent 开始复核...")
+        audit_input = f"原始数据参考: \n{user_input}\n\n待审计的分析报告: \n{analysis_res}"
+        audit_res = self._call_deepseek(AUDITOR_SYSTEM_PROMPT, audit_input)
+        print("-" * 30)
+        print(audit_res)
+        
+        return analysis_res, audit_res
+
+
+def compare(sample_output,act_num):
+    FILE_PATH = f"/home/tma/jupyterlab/RPAtoTMA/discountActivity/{act_num}.json"
+    sample_activity = load_json(FILE_PATH)
+    agent = PaymentReActAgent(API_KEY)
+    analysis,audit = agent.analyze(sample_output, sample_activity)
+    return analysis,audit
